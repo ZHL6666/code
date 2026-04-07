@@ -1,0 +1,15 @@
+// 测试优化器的示例程序
+
+fn main() {
+    // 常量折叠测试
+    let a = 10;
+    let b = 20;
+    let c = a + b;  // 应该被折叠为 30
+    
+    // 死代码测试
+    let unused = 999;
+    let d = c * 2;
+    
+    println(c);
+    println(d);
+}
