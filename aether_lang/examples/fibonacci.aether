@@ -1,0 +1,151 @@
+// 斐波那契数列 - 展示递归、模式匹配和性能优化
+
+use std::time
+
+// 基础递归版本（教学用途）
+fn fib_recursive(n: Int) -> Int {
+    match n {
+        0 => 0,
+        1 => 1,
+        _ => fib_recursive(n - 1) + fib_recursive(n - 2)
+    }
+}
+
+// 尾递归优化版本
+fn fib_tail(n: Int) -> Int {
+    fn helper(current: Int, a: Int, b: Int) -> Int {
+        if current == 0 {
+            a
+        } else {
+            helper(current - 1, b, a + b)
+        }
+    }
+    helper(n, 0, 1)
+}
+
+// 迭代版本（最高效）
+fn fib_iterative(n: Int) -> Int {
+    if n <= 1 {
+        return n
+    }
+    
+    var a = 0
+    var b = 1
+    
+    for _ in 2..(n + 1) {
+        let temp = a + b
+        a = b
+        b = temp
+    }
+    
+    b
+}
+
+// 使用记忆化的动态规划版本
+fn fib_memo(n: Int) -> Int {
+    let memo = HashMap[Int, Int]()
+    
+    fn helper(n: Int, memo: &mut HashMap[Int, Int]) -> Int {
+        if n <= 1 {
+            return n
+        }
+        
+        if memo.contains(n) {
+            return memo.get(n).unwrap()
+        }
+        
+        let result = helper(n - 1, memo) + helper(n - 2, memo)
+        memo.insert(n, result)
+        result
+    }
+    
+    helper(n, &mut memo)
+}
+
+// 生成斐波那契数列
+fn fib_sequence(count: Int) -> Vec[Int] {
+    let mut result = Vec[Int]()
+    
+    for i in 0..count {
+        result.push(fib_iterative(i))
+    }
+    
+    result
+}
+
+// 使用管道操作符的函数式版本
+fn fib_functional(count: Int) -> Vec[Int] {
+    (0..count)
+    |> map(fn(i) { fib_iterative(i) })
+    |> collect()
+}
+
+// 基准测试
+@bench
+fn benchmark_fib() {
+    let n = 30
+    
+    let start = time.now()
+    let _ = fib_recursive(n)
+    println(f"Recursive: {time.now() - start}ms")
+    
+    let start = time.now()
+    let _ = fib_tail(n)
+    println(f"Tail recursive: {time.now() - start}ms")
+    
+    let start = time.now()
+    let _ = fib_iterative(n)
+    println(f"Iterative: {time.now() - start}ms")
+    
+    let start = time.now()
+    let _ = fib_memo(n)
+    println(f"Memoized: {time.now() - start}ms")
+}
+
+// 主函数
+fn main() {
+    println("=== 斐波那契数列示例 ===\n")
+    
+    // 打印前 20 个斐波那契数
+    println("前 20 个斐波那契数:")
+    let sequence = fib_sequence(20)
+    for (i, value) in sequence.enumerate() {
+        println(f"F({i}) = {value}")
+    }
+    
+    println("\n第 50 个斐波那契数:")
+    println(f"F(50) = {fib_iterative(50)}")
+    
+    // 运行基准测试
+    println("\n性能对比:")
+    benchmark_fib()
+}
+
+// 单元测试
+#[test]
+fn test_fib_base_cases() {
+    assert_eq!(fib_iterative(0), 0)
+    assert_eq!(fib_iterative(1), 1)
+    assert_eq!(fib_iterative(2), 1)
+    assert_eq!(fib_iterative(3), 2)
+}
+
+#[test]
+fn test_fib_larger_values() {
+    assert_eq!(fib_iterative(10), 55)
+    assert_eq!(fib_iterative(20), 6765)
+}
+
+#[test]
+fn test_all_implementations_equal() {
+    for i in 0..20 {
+        let a = fib_recursive(i)
+        let b = fib_tail(i)
+        let c = fib_iterative(i)
+        let d = fib_memo(i)
+        
+        assert_eq!(a, b, f"Failed at {i}: recursive != tail")
+        assert_eq!(b, c, f"Failed at {i}: tail != iterative")
+        assert_eq!(c, d, f"Failed at {i}: iterative != memo")
+    }
+}

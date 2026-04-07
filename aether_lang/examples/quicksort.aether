@@ -1,0 +1,42 @@
+// Aether 语言示例程序 - 快速排序
+
+fn quicksort(arr: Array, left: Int, right: Int) -> Int {
+    if left >= right {
+        return 0;
+    }
+    
+    let pivot = arr[(left + right) / 2];
+    let mut i = left;
+    let mut j = right;
+    
+    while i <= j {
+        while arr[i] < pivot {
+            i = i + 1;
+        }
+        while arr[j] > pivot {
+            j = j - 1;
+        }
+        if i <= j {
+            let temp = arr[i];
+            arr[i] = arr[j];
+            arr[j] = temp;
+            i = i + 1;
+            j = j - 1;
+        }
+    }
+    
+    if left < j {
+        quicksort(arr, left, j);
+    }
+    if i < right {
+        quicksort(arr, i, right);
+    }
+    
+    return 0;
+}
+
+fn main() -> Int {
+    let data = [64, 34, 25, 12, 22, 11, 90, 88, 45, 50];
+    let sorted = quicksort(data, 0, 9);
+    return sorted;
+}

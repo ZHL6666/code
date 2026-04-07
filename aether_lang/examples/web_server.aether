@@ -1,0 +1,343 @@
+// Web 服务器示例 - 展示异步编程、错误处理和 API 设计
+
+use std::net::http_server
+use std::collections::HashMap
+use std::result::Result
+
+// 用户数据模型
+@derive(Debug, Clone, Serialize, Deserialize)
+struct User {
+    id: Int,
+    name: String,
+    email: String,
+    age: Int
+}
+
+// API 响应结构
+@derive(Debug, Serialize)
+struct ApiResponse<T> {
+    success: Bool,
+    data: Option<T>,
+    error: Option<String>
+}
+
+// 数据库模拟（实际项目中会连接真实数据库）
+actor Database {
+    var users: HashMap[Int, User] = HashMap()
+    var next_id: Int = 1
+    
+    message Create(user_data: CreateUserRequest, reply_to: Channel<Result<User, String>>) {
+        let user = User {
+            id: next_id,
+            name: user_data.name,
+            email: user_data.email,
+            age: user_data.age
+        }
+        
+        users.insert(next_id, user.clone())
+        next_id += 1
+        
+        reply_to.send(Ok(user))
+    }
+    
+    message GetById(id: Int, reply_to: Channel<Result<User, String>>) {
+        match users.get(id) {
+            Some(user) => reply_to.send(Ok(user.clone())),
+            None => reply_to.send(Err(f"User with id {id} not found"))
+        }
+    }
+    
+    message GetAll(reply_to: Channel<Vec<User>>) {
+        reply_to.send(users.values().collect())
+    }
+    
+    message Update(id: Int, updates: UpdateUserRequest, reply_to: Channel<Result<User, String>>) {
+        if let Some(mut user) = users.get_mut(id) {
+            if let Some(name) = updates.name {
+                user.name = name
+            }
+            if let Some(email) = updates.email {
+                user.email = email
+            }
+            if let Some(age) = updates.age {
+                user.age = age
+            }
+            
+            reply_to.send(Ok(user.clone()))
+        } else {
+            reply_to.send(Err(f"User with id {id} not found"))
+        }
+    }
+    
+    message Delete(id: Int, reply_to: Channel<Result<(), String>>) {
+        if users.remove(id).is_some() {
+            reply_to.send(Ok(()))
+        } else {
+            reply_to.send(Err(f"User with id {id} not found"))
+        }
+    }
+}
+
+// 请求/响应模型
+@derive(Debug, Deserialize)
+struct CreateUserRequest {
+    name: String,
+    email: String,
+    age: Int
+}
+
+@derive(Debug, Deserialize)
+struct UpdateUserRequest {
+    name: Option<String>,
+    email: Option<String>,
+    age: Option<Int>
+}
+
+// 中间件系统
+trait Middleware {
+    fn handle(request: Request, next: Fn(Request) -> Response) -> Response
+}
+
+// 日志中间件
+struct LoggingMiddleware {
+    prefix: String
+}
+
+impl Middleware for LoggingMiddleware {
+    fn handle(request: Request, next: Fn(Request) -> Response) -> Response {
+        println(f"[{self.prefix}] {request.method} {request.path}")
+        let start = std::time.now()
+        
+        let response = next(request)
+        
+        let duration = std::time.now() - start
+        println(f"[{self.prefix}] Completed in {duration}ms - {response.status}")
+        
+        response
+    }
+}
+
+// 认证中间件
+struct AuthMiddleware {
+    api_keys: HashSet<String>
+}
+
+impl Middleware for AuthMiddleware {
+    fn handle(request: Request, next: Fn(Request) -> Response) -> Response {
+        // 跳过登录和注册接口的认证
+        if request.path.starts_with("/api/auth/") {
+            return next(request)
+        }
+        
+        match request.headers.get("Authorization") {
+            Some(token) => {
+                if validate_token(token) {
+                    next(request)
+                } else {
+                    Response.unauthorized("Invalid token")
+                }
+            },
+            None => Response.unauthorized("Missing authorization header")
+        }
+    }
+}
+
+fn validate_token(token: String) -> Bool {
+    // 实际的令牌验证逻辑
+    token.starts_with("Bearer ") && token.length() > 7
+}
+
+// 路由处理器
+async fn handle_get_users(db: &Channel<Database>) -> Response {
+    let (reply_channel, result) = Channel::new()
+    
+    db.send(DatabaseMessage.GetAll(reply_channel))
+    let users = await result
+    
+    let response = ApiResponse {
+        success: true,
+        data: Some(users),
+        error: None
+    }
+    
+    Response.json(response)
+}
+
+async fn handle_get_user(db: &Channel<Database>, id: Int) -> Response {
+    let (reply_channel, result) = Channel::new()
+    
+    db.send(DatabaseMessage.GetById(id, reply_channel))
+    let user_result = await result
+    
+    match user_result {
+        Ok(user) => {
+            let response = ApiResponse {
+                success: true,
+                data: Some(user),
+                error: None
+            }
+            Response.json(response)
+        },
+        Err(msg) => {
+            let response = ApiResponse::<User> {
+                success: false,
+                data: None,
+                error: Some(msg)
+            }
+            Response.not_found(json(response))
+        }
+    }
+}
+
+async fn handle_create_user(db: &Channel<Database>, body: CreateUserRequest) -> Response {
+    // 验证输入
+    if body.name.is_empty() {
+        return Response.bad_request("Name is required")
+    }
+    
+    if !body.email.contains("@") {
+        return Response.bad_request("Invalid email format")
+    }
+    
+    if body.age < 0 || body.age > 150 {
+        return Response.bad_request("Invalid age")
+    }
+    
+    let (reply_channel, result) = Channel::new()
+    
+    db.send(DatabaseMessage.Create(body, reply_channel))
+    let user_result = await result
+    
+    match user_result {
+        Ok(user) => {
+            let response = ApiResponse {
+                success: true,
+                data: Some(user),
+                error: None
+            }
+            Response.created(json(response))
+        },
+        Err(msg) => {
+            let response = ApiResponse::<User> {
+                success: false,
+                data: None,
+                error: Some(msg)
+            }
+            Response.internal_error(json(response))
+        }
+    }
+}
+
+// 主函数
+async fn main() {
+    println("=== Aether Web 服务器示例 ===\n")
+    
+    // 初始化数据库 actor
+    let db = Database.spawn()
+    
+    // 创建服务器实例
+    let server = http_server.Server.new("0.0.0.0:8080")
+    
+    // 添加中间件
+    server.use(LoggingMiddleware { prefix: "HTTP" })
+    server.use(AuthMiddleware { api_keys: HashSet() })
+    
+    // 定义路由
+    server.get("/", fn(req) {
+        Response.html("""
+        <html>
+            <head><title>Aether Server</title></head>
+            <body>
+                <h1>Welcome to Aether Web Server</h1>
+                <p>API Endpoints:</p>
+                <ul>
+                    <li>GET /api/users - List all users</li>
+                    <li>GET /api/users/:id - Get user by ID</li>
+                    <li>POST /api/users - Create new user</li>
+                    <li>PUT /api/users/:id - Update user</li>
+                    <li>DELETE /api/users/:id - Delete user</li>
+                </ul>
+            </body>
+        </html>
+        """)
+    })
+    
+    // RESTful API 路由
+    server.get("/api/users", async |req| {
+        await handle_get_users(&db)
+    })
+    
+    server.get("/api/users/:id", async |req| {
+        let id = req.params.get("id").parse::<Int>()?
+        await handle_get_user(&db, id)
+    })
+    
+    server.post("/api/users", async |req| {
+        let body = await req.json::<CreateUserRequest>()?
+        await handle_create_user(&db, body)
+    })
+    
+    server.put("/api/users/:id", async |req| {
+        let id = req.params.get("id").parse::<Int>()?
+        let body = await req.json::<UpdateUserRequest>()?
+        // 实现更新逻辑...
+        Response.ok("User updated")
+    })
+    
+    server.delete("/api/users/:id", async |req| {
+        let id = req.params.get("id").parse::<Int>()?
+        // 实现删除逻辑...
+        Response.ok("User deleted")
+    })
+    
+    // 健康检查端点
+    server.get("/health", fn(req) {
+        Response.json({
+            status: "healthy",
+            timestamp: std::time.now(),
+            version: "1.0.0"
+        })
+    })
+    
+    // 错误处理
+    server.on_error(fn(error) {
+        println(f"Server error: {error}")
+        Response.internal_error("Internal server error")
+    })
+    
+    // 启动服务器
+    println("Server running on http://localhost:8080")
+    println("Press Ctrl+C to stop\n")
+    
+    try {
+        await server.start()
+    } catch error {
+        println(f"Server failed to start: {error}")
+    } finally {
+        println("Shutting down gracefully...")
+        db.stop()
+    }
+}
+
+// 单元测试
+#[test]
+fn test_validate_email() {
+    assert_eq!(validate_email("test@example.com"), true)
+    assert_eq!(validate_email("invalid-email"), false)
+    assert_eq!(validate_email("missing@domain"), false)
+}
+
+#[test]
+fn test_age_validation() {
+    assert_eq!(validate_age(25), true)
+    assert_eq!(validate_age(-1), false)
+    assert_eq!(validate_age(151), false)
+}
+
+fn validate_email(email: String) -> Bool {
+    email.contains("@") && email.contains(".")
+}
+
+fn validate_age(age: Int) -> Bool {
+    age >= 0 && age <= 150
+}
