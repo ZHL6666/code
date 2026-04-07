@@ -1,0 +1,46 @@
+[package]
+name = "aetherc"
+version = "0.1.0"
+edition = "2021"
+authors = ["Aether Team"]
+description = "Aether Programming Language Compiler"
+license = "MIT"
+
+[dependencies]
+# LLVM bindings
+inkwell = "0.2"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Command line parsing
+clap = { version = "4.0", features = ["derive"] }
+
+# Data structures
+indexmap = "2.0"
+arena = "0.1"
+
+# Testing
+regex = "1.9"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.0"
+
+[[bin]]
+name = "aetherc"
+path = "src/main.rs"
+
+[lib]
+name = "aether_compiler"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
