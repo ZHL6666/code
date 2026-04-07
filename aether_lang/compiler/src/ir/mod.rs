@@ -253,15 +253,33 @@ impl Default for IRContext {
 
 /// 从 AST 生成 IR 的入口函数
 pub fn generate(ast: crate::ast::Module) -> crate::error::Result<ModuleIR> {
-    // TODO: 实现完整的 IR 生成
-    // 这里提供一个简单的框架
-    
     let mut module_ir = ModuleIR::new();
+    let mut context = IRContext::new();
     
+    // 先生成全局变量
+    for item in &ast.items {
+        if let crate::ast::Item::Global(var_decl) = item {
+            let global = GlobalVar {
+                name: var_decl.name.clone(),
+                var_type: var_decl.var_type.clone(),
+                initial_value: var_decl.initial_value.as_ref().map(|lit| match lit {
+                    crate::ast::Literal::Int(v) => Literal::Int(*v),
+                    crate::ast::Literal::Float(v) => Literal::Float(*v),
+                    crate::ast::Literal::Bool(v) => Literal::Bool(*v),
+                    crate::ast::Literal::Str(v) => Literal::Str(v.clone()),
+                    crate::ast::Literal::Char(v) => Literal::Char(*v),
+                    crate::ast::Literal::None => Literal::None,
+                }),
+            };
+            module_ir.globals.push(global);
+        }
+    }
+    
+    // 生成函数
     for item in ast.items {
         match item {
             crate::ast::Item::Function(func) => {
-                let func_ir = generate_function(func)?;
+                let func_ir = generate_function(func, &mut context)?;
                 module_ir.functions.push(func_ir);
             }
             // 其他项暂不处理
@@ -273,7 +291,7 @@ pub fn generate(ast: crate::ast::Module) -> crate::error::Result<ModuleIR> {
 }
 
 /// 生成函数 IR
-fn generate_function(func: crate::ast::Function) -> crate::error::Result<FunctionIR> {
+fn generate_function(func: crate::ast::Function, context: &mut IRContext) -> crate::error::Result<FunctionIR> {
     let mut func_ir = FunctionIR::new(
         func.name.clone(),
         func.params.iter().map(|p| p.name.clone()).collect(),
@@ -284,9 +302,229 @@ fn generate_function(func: crate::ast::Function) -> crate::error::Result<Functio
     let entry_block = BasicBlock::new(Label::new("entry"));
     func_ir.blocks.push(entry_block);
     
-    // TODO: 实现完整的函数体 IR 生成
+    // 将参数复制到局部变量
+    if let Some(block) = func_ir.blocks.last_mut() {
+        for (i, param) in func.params.iter().enumerate() {
+            block.add_instruction(Instruction::Copy(
+                Operand::Variable(param.name.clone()),
+                Operand::Temp(i),
+            ));
+        }
+    }
+    
+    // 生成函数体 IR
+    if let Some(body) = func.body {
+        generate_block(&body, &mut func_ir, context)?;
+    } else {
+        // 空函数返回 unit
+        if let Some(block) = func_ir.blocks.last_mut() {
+            block.add_terminator(Instruction::Return(None));
+        }
+    }
     
     Ok(func_ir)
+}
+
+/// 生成语句块的 IR
+fn generate_block(
+    block: &crate::ast::Block,
+    func_ir: &mut FunctionIR,
+    context: &mut IRContext,
+) -> crate::error::Result<Option<Operand>> {
+    let mut last_value = None;
+    
+    for stmt in &block.statements {
+        last_value = generate_statement(stmt, func_ir, context)?;
+    }
+    
+    // 返回最后一个表达式的值（如果有）
+    if let Some(expr) = &block.final_expr {
+        last_value = generate_expression(expr, func_ir, context)?;
+    }
+    
+    Ok(last_value)
+}
+
+/// 生成语句的 IR
+fn generate_statement(
+    stmt: &crate::ast::Statement,
+    func_ir: &mut FunctionIR,
+    context: &mut IRContext,
+) -> crate::error::Result<Option<Operand>> {
+    match stmt {
+        crate::ast::Statement::Let(let_decl) => {
+            let value = if let Some(expr) = &let_decl.initializer {
+                generate_expression(expr, func_ir, context)?
+            } else {
+                Some(Operand::Unit)
+            };
+            
+            if let Some(val_operand) = value {
+                let current_block = func_ir.blocks.last_mut().unwrap();
+                current_block.add_instruction(Instruction::Copy(
+                    Operand::Variable(let_decl.name.clone()),
+                    val_operand,
+                ));
+            }
+            Ok(None)
+        }
+        crate::ast::Statement::Expr(expr) => {
+            generate_expression(expr, func_ir, context)
+        }
+        crate::ast::Statement::Item(item) => {
+            // 局部 item（如嵌套函数），暂时跳过
+            Ok(None)
+        }
+    }
+}
+
+/// 生成表达式的 IR
+fn generate_expression(
+    expr: &crate::ast::Expression,
+    func_ir: &mut FunctionIR,
+    context: &mut IRContext,
+) -> crate::error::Result<Option<Operand>> {
+    let current_block = func_ir.blocks.last_mut().unwrap();
+    
+    match expr {
+        crate::ast::Expression::Literal(lit) => {
+            let temp_id = func_ir.new_temp();
+            let literal = match lit {
+                crate::ast::Literal::Int(v) => Literal::Int(*v),
+                crate::ast::Literal::Float(v) => Literal::Float(*v),
+                crate::ast::Literal::Bool(v) => Literal::Bool(*v),
+                crate::ast::Literal::Str(v) => Literal::Str(v.clone()),
+                crate::ast::Literal::Char(v) => Literal::Char(*v),
+                crate::ast::Literal::None => Literal::None,
+            };
+            current_block.add_instruction(Instruction::Const(
+                Operand::Temp(temp_id),
+                literal,
+            ));
+            Ok(Some(Operand::Temp(temp_id)))
+        }
+        
+        crate::ast::Expression::Identifier(name) => {
+            Ok(Some(Operand::Variable(name.clone())))
+        }
+        
+        crate::ast::Expression::Binary(left, op, right) => {
+            let left_op = generate_expression(left, func_ir, context)?;
+            let right_op = generate_expression(right, func_ir, context)?;
+            
+            if let (Some(left_val), Some(right_val)) = (left_op, right_op) {
+                let temp_id = func_ir.new_temp();
+                current_block.add_instruction(Instruction::BinOp(
+                    Operand::Temp(temp_id),
+                    left_val,
+                    op.clone(),
+                    right_val,
+                ));
+                Ok(Some(Operand::Temp(temp_id)))
+            } else {
+                Ok(None)
+            }
+        }
+        
+        crate::ast::Expression::Unary(op, operand) => {
+            let operand_op = generate_expression(operand, func_ir, context)?;
+            if let Some(val) = operand_op {
+                let temp_id = func_ir.new_temp();
+                current_block.add_instruction(Instruction::UnaryOp(
+                    Operand::Temp(temp_id),
+                    op.clone(),
+                    val,
+                ));
+                Ok(Some(Operand::Temp(temp_id)))
+            } else {
+                Ok(None)
+            }
+        }
+        
+        crate::ast::Expression::Call(func_name, args) => {
+            let mut arg_operands = Vec::new();
+            for arg in args {
+                if let Some(arg_op) = generate_expression(arg, func_ir, context)? {
+                    arg_operands.push(arg_op);
+                }
+            }
+            
+            let temp_id = func_ir.new_temp();
+            current_block.add_instruction(Instruction::Call(
+                Operand::Temp(temp_id),
+                func_name.clone(),
+                arg_operands,
+            ));
+            Ok(Some(Operand::Temp(temp_id)))
+        }
+        
+        crate::ast::Expression::If(cond, then_block, else_block) => {
+            let cond_op = generate_expression(cond, func_ir, context)?;
+            
+            let then_label = Label::unique("then", func_ir.new_temp());
+            let else_label = Label::unique("else", func_ir.new_temp());
+            let end_label = Label::unique("if_end", func_ir.new_temp());
+            
+            // 条件跳转
+            if let Some(cond_val) = cond_op {
+                current_block.add_terminator(Instruction::CondBranch(
+                    cond_val,
+                    then_label.clone(),
+                    else_label.clone(),
+                ));
+            }
+            
+            // then 分支
+            let mut then_func_ir = FunctionIR::new("".to_string(), vec![], None);
+            then_func_ir.blocks.push(BasicBlock::new(then_label.clone()));
+            let then_value = generate_block(then_block, &mut then_func_ir, context)?;
+            
+            // else 分支
+            let mut else_func_ir = FunctionIR::new("".to_string(), vec![], None);
+            else_func_ir.blocks.push(BasicBlock::new(else_label.clone()));
+            let else_value = if let Some(else_blk) = else_block {
+                generate_block(else_blk, &mut else_func_ir, context)?
+            } else {
+                Some(Operand::Unit)
+            };
+            
+            // 合并分支到主函数
+            func_ir.blocks.extend(then_func_ir.blocks);
+            func_ir.blocks.extend(else_func_ir.blocks);
+            
+            // 添加结束块
+            let mut end_block = BasicBlock::new(end_label.clone());
+            if let Some(then_val) = then_value {
+                end_block.add_instruction(Instruction::Copy(
+                    Operand::Temp(func_ir.new_temp()),
+                    then_val,
+                ));
+            }
+            if let Some(else_val) = else_value {
+                end_block.add_instruction(Instruction::Copy(
+                    Operand::Temp(func_ir.new_temp()),
+                    else_val,
+                ));
+            }
+            func_ir.blocks.push(end_block);
+            
+            Ok(None)
+        }
+        
+        crate::ast::Expression::Return(expr) => {
+            let return_val = if let Some(e) = expr {
+                generate_expression(e, func_ir, context)?
+            } else {
+                None
+            };
+            
+            current_block.add_terminator(Instruction::Return(return_val));
+            Ok(None)
+        }
+        
+        // 其他表达式类型暂时返回 None
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]

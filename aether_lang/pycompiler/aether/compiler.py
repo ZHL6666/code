@@ -88,6 +88,10 @@ class TokenType(Enum):
     EOF = "EOF"
     NEWLINE = "NEWLINE"
     COMMENT = "COMMENT"
+    
+    # 引用操作符
+    AMPERSAND = "&"
+    MUT = "mut"
 
 
 class Keyword(Enum):
@@ -398,13 +402,16 @@ class Lexer:
                 if self._match(expected):
                     return Token(token_type, ch + expected, start_line, start_column)
         
-        # 单字符运算符映射
+        # 单字符运算符映射 - 注意：& 现在作为引用操作符单独处理
         single_ops = {
             '+': TokenType.PLUS, '-': TokenType.MINUS, '*': TokenType.STAR,
             '/': TokenType.SLASH, '=': TokenType.EQUAL, '!': TokenType.NOT,
-            '<': TokenType.LESS, '>': TokenType.GREATER, '&': TokenType.BIT_AND,
-            '|': TokenType.BIT_OR,
+            '<': TokenType.LESS, '>': TokenType.GREATER, '|': TokenType.BIT_OR,
         }
+        
+        # & 特殊处理：作为引用操作符而不是位与
+        if ch == '&':
+            return Token(TokenType.AMPERSAND, ch, start_line, start_column)
         
         if ch in single_ops:
             return Token(single_ops[ch], ch, start_line, start_column)
@@ -445,6 +452,13 @@ class BinaryOp(ASTNode):
 class UnaryOp(ASTNode):
     operator: str = ""
     operand: ASTNode = field(default_factory=lambda: ASTNode())
+
+
+@dataclass
+class ReferenceExpr(ASTNode):
+    """引用表达式 (&x 或 &mut x)"""
+    operand: ASTNode = field(default_factory=lambda: ASTNode())
+    is_mut: bool = False
 
 
 @dataclass
@@ -1175,6 +1189,17 @@ class Parser:
         return left
     
     def _parse_unary(self) -> ASTNode:
+        # 引用操作符 & 和 &mut
+        if self._check(TokenType.AMPERSAND):
+            self._advance()
+            is_mut = False
+            if self._check(TokenType.KEYWORD) and self._peek().keyword == Keyword.MUT:
+                self._advance()
+                is_mut = True
+            operand = self._parse_unary()
+            return ReferenceExpr(operand=operand, is_mut=is_mut,
+                               line=self._previous().line, column=self._previous().column)
+        
         if self._check(TokenType.MINUS, TokenType.NOT, TokenType.BIT_NOT):
             op_token = self._advance()
             operand = self._parse_unary()
@@ -1366,10 +1391,11 @@ class IRGenerator:
         self._emit("FUNCTION", dest=label, operands=[func.name], line=func.line)
         
         self._enter_scope()
-        for param_name, param_type in func.params:
+        # 将参数注册到当前作用域
+        for i, (param_name, param_type) in enumerate(func.params):
             temp = self._new_temp()
             self._current_scope()[param_name] = temp
-            self._emit("PARAM", dest=temp, operands=[param_name], line=func.line)
+            self._emit("PARAM", dest=temp, operands=[param_name, i], line=func.line)
         
         if func.body:
             self._generate_block(func.body)
@@ -1387,7 +1413,7 @@ class IRGenerator:
         
         if decl.initializer:
             value = self._generate_expression(decl.initializer)
-            self._emit("STORE", dest=temp, operands=[value], line=decl.line)
+            self._emit("COPY", dest=temp, operands=[value], line=decl.line)
         else:
             self._emit("ALLOC", dest=temp, operands=[decl.type_annotation or "any"], line=decl.line)
     
@@ -1460,6 +1486,7 @@ class IRGenerator:
         elif isinstance(expr, Identifier):
             if expr.name in self._current_scope():
                 return self._current_scope()[expr.name]
+            # 全局变量或函数参数
             temp = self._new_temp()
             self._emit("LOAD_GLOBAL", dest=temp, operands=[expr.name], line=expr.line)
             return temp
@@ -1485,8 +1512,15 @@ class IRGenerator:
         
         elif isinstance(expr, Assignment):
             value = self._generate_expression(expr.value)
-            # 简化处理
-            self._emit("STORE", dest=value, operands=[value], line=expr.line)
+            # 查找目标变量在作用域中的映射
+            if isinstance(expr.target, Identifier):
+                target_name = expr.target.name
+                if target_name in self._current_scope():
+                    target_temp = self._current_scope()[target_name]
+                    self._emit("STORE", dest=target_temp, operands=[value], line=expr.line)
+                else:
+                    # 新变量声明
+                    self._current_scope()[target_name] = value
             return value
         
         elif isinstance(expr, Call):
@@ -1509,6 +1543,361 @@ class IRGenerator:
 
 
 # ============================================================================
+# 优化器
+# ============================================================================
+
+class Optimizer:
+    """IR 优化器 - 实现多种优化通道"""
+    
+    def __init__(self, optimization_level: int = 1):
+        self.optimization_level = optimization_level
+    
+    def optimize(self, ir: List[IRInstruction]) -> List[IRInstruction]:
+        """执行优化"""
+        if self.optimization_level == 0:
+            return ir
+        
+        optimized = ir
+        
+        # 优化级别 1: 常量折叠和死代码消除
+        if self.optimization_level >= 1:
+            optimized = self.constant_folding(optimized)
+            optimized = self.dead_code_elimination(optimized)
+        
+        # 优化级别 2: 公共子表达式消除和常量传播
+        if self.optimization_level >= 2:
+            optimized = self.common_subexpression_elimination(optimized)
+            optimized = self.constant_propagation(optimized)
+        
+        # 优化级别 3: 循环不变量外提
+        if self.optimization_level >= 3:
+            optimized = self.loop_invariant_code_motion(optimized)
+        
+        return optimized
+    
+    def constant_folding(self, ir: List[IRInstruction]) -> List[IRInstruction]:
+        """常量折叠 - 在编译时计算常量表达式"""
+        constants: Dict[str, Any] = {}
+        result = []
+        
+        for instr in ir:
+            if instr.opcode == 'LOAD_CONST' and instr.dest:
+                # 记录常量
+                if len(instr.operands) >= 1:
+                    constants[instr.dest] = instr.operands[0]
+                result.append(instr)
+            
+            elif instr.opcode in ('ADD', 'SUB', 'MUL', 'DIV', 'MOD', 
+                                  'EQ', 'NE', 'LT', 'LE', 'GT', 'GE',
+                                  'AND', 'OR'):
+                # 检查两个操作数是否都是常量
+                if (len(instr.operands) >= 2 and 
+                    instr.operands[0] in constants and 
+                    instr.operands[1] in constants):
+                    
+                    left = constants[instr.operands[0]]
+                    right = constants[instr.operands[1]]
+                    
+                    # 计算结果
+                    calc_result = self._evaluate_binary_op(instr.opcode, left, right)
+                    
+                    if calc_result is not None:
+                        # 替换为常量加载
+                        new_instr = IRInstruction(
+                            opcode='LOAD_CONST',
+                            dest=instr.dest,
+                            operands=[calc_result],
+                            line=instr.line
+                        )
+                        result.append(new_instr)
+                        if instr.dest:
+                            constants[instr.dest] = calc_result
+                        continue
+            
+            elif instr.opcode == 'NOT' and len(instr.operands) >= 1:
+                operand = instr.operands[0]
+                if operand in constants and isinstance(constants[operand], bool):
+                    # 折叠 NOT
+                    new_instr = IRInstruction(
+                        opcode='LOAD_CONST',
+                        dest=instr.dest,
+                        operands=[not constants[operand]],
+                        line=instr.line
+                    )
+                    result.append(new_instr)
+                    if instr.dest:
+                        constants[instr.dest] = not constants[operand]
+                    continue
+            
+            elif instr.opcode == 'NEG' and len(instr.operands) >= 1:
+                operand = instr.operands[0]
+                if operand in constants and isinstance(constants[operand], (int, float)):
+                    # 折叠 NEG
+                    new_instr = IRInstruction(
+                        opcode='LOAD_CONST',
+                        dest=instr.dest,
+                        operands=[-constants[operand]],
+                        line=instr.line
+                    )
+                    result.append(new_instr)
+                    if instr.dest:
+                        constants[instr.dest] = -constants[operand]
+                    continue
+            
+            else:
+                # 非纯函数调用会清除相关常量
+                if instr.opcode == 'CALL':
+                    # 简化处理：不清除，实际应该更精确
+                    pass
+            
+            result.append(instr)
+        
+        return result
+    
+    def _evaluate_binary_op(self, op: str, left: Any, right: Any) -> Optional[Any]:
+        """计算二元运算的结果"""
+        try:
+            if op == 'ADD':
+                return left + right
+            elif op == 'SUB':
+                return left - right
+            elif op == 'MUL':
+                return left * right
+            elif op == 'DIV' and right != 0:
+                if isinstance(left, int) and isinstance(right, int):
+                    return left // right
+                return left / right
+            elif op == 'MOD' and right != 0:
+                return left % right
+            elif op == 'EQ':
+                return left == right
+            elif op == 'NE':
+                return left != right
+            elif op == 'LT':
+                return left < right
+            elif op == 'LE':
+                return left <= right
+            elif op == 'GT':
+                return left > right
+            elif op == 'GE':
+                return left >= right
+            elif op == 'AND':
+                return bool(left) and bool(right)
+            elif op == 'OR':
+                return bool(left) or bool(right)
+        except (TypeError, ZeroDivisionError):
+            pass
+        return None
+    
+    def dead_code_elimination(self, ir: List[IRInstruction]) -> List[IRInstruction]:
+        """死代码消除 - 移除未使用的指令"""
+        # 收集所有使用的变量
+        used_vars = set()
+        
+        # 第一次遍历：收集所有在跳转、返回、调用中使用的变量
+        for instr in ir:
+            if instr.opcode in ('JUMP_IF_FALSE',):
+                if len(instr.operands) >= 1 and isinstance(instr.operands[0], str):
+                    used_vars.add(instr.operands[0])
+            elif instr.opcode == 'RETURN' and instr.operands:
+                if isinstance(instr.operands[0], str):
+                    used_vars.add(instr.operands[0])
+            elif instr.opcode == 'CALL':
+                for op in instr.operands[1:]:  # 跳过函数名
+                    if isinstance(op, str):
+                        used_vars.add(op)
+        
+        # 反向迭代传播使用信息
+        changed = True
+        while changed:
+            changed = False
+            for instr in reversed(ir):
+                if instr.dest and instr.dest in used_vars:
+                    # 这个指令产生被使用的值，标记其操作数为已使用
+                    for op in instr.operands:
+                        if isinstance(op, str) and op not in used_vars:
+                            used_vars.add(op)
+                            changed = True
+                
+                if instr.opcode in ('ADD', 'SUB', 'MUL', 'DIV', 'MOD',
+                                    'EQ', 'NE', 'LT', 'LE', 'GT', 'GE',
+                                    'AND', 'OR', 'NOT', 'NEG'):
+                    for op in instr.operands:
+                        if isinstance(op, str) and op in used_vars:
+                            if instr.dest and instr.dest not in used_vars:
+                                used_vars.add(instr.dest)
+                                changed = True
+        
+        # 移除未使用的指令（保留有副作用的指令）
+        result = []
+        for instr in ir:
+            # 总是保留有副作用的指令
+            if instr.opcode in ('CALL', 'STORE', 'JUMP', 'JUMP_IF_FALSE', 
+                               'LABEL', 'RETURN', 'FUNCTION', 'END_FUNCTION',
+                               'BREAK', 'CONTINUE'):
+                result.append(instr)
+            # 保留产生被使用值的指令
+            elif instr.dest and instr.dest in used_vars:
+                result.append(instr)
+            # 保留没有目标的指令（可能是标签等）
+            elif not instr.dest:
+                result.append(instr)
+            # 其他情况：未使用的指令，移除
+            else:
+                pass  # 死代码
+        
+        return result
+    
+    def common_subexpression_elimination(self, ir: List[IRInstruction]) -> List[IRInstruction]:
+        """公共子表达式消除 - 重用已计算的表达式"""
+        expr_map: Dict[Tuple[str, Any, Any], str] = {}
+        result = []
+        
+        for instr in ir:
+            if instr.opcode in ('ADD', 'SUB', 'MUL', 'DIV', 'MOD',
+                                'EQ', 'NE', 'LT', 'LE', 'GT', 'GE',
+                                'AND', 'OR'):
+                if len(instr.operands) >= 2:
+                    # 创建表达式键（规范化顺序用于可交换操作符）
+                    left, right = instr.operands[0], instr.operands[1]
+                    if instr.opcode in ('ADD', 'MUL', 'EQ', 'NE', 'AND', 'OR'):
+                        key = (instr.opcode, min(left, right), max(left, right))
+                    else:
+                        key = (instr.opcode, left, right)
+                    
+                    if key in expr_map:
+                        # 表达式已计算过，使用 COPY
+                        existing = expr_map[key]
+                        new_instr = IRInstruction(
+                            opcode='COPY',
+                            dest=instr.dest,
+                            operands=[existing],
+                            line=instr.line
+                        )
+                        result.append(new_instr)
+                        continue
+                    else:
+                        # 记录新表达式
+                        if instr.dest:
+                            expr_map[key] = instr.dest
+            
+            result.append(instr)
+        
+        return result
+    
+    def constant_propagation(self, ir: List[IRInstruction]) -> List[IRInstruction]:
+        """常量传播 - 将常量值传播到使用位置"""
+        constants: Dict[str, Any] = {}
+        result = []
+        
+        for instr in ir:
+            # 更新常量信息
+            if instr.opcode == 'LOAD_CONST' and instr.dest:
+                if len(instr.operands) >= 1:
+                    constants[instr.dest] = instr.operands[0]
+            
+            # 传播常量到操作数
+            new_operands = []
+            for op in instr.operands:
+                if isinstance(op, str) and op in constants:
+                    new_operands.append(constants[op])
+                else:
+                    new_operands.append(op)
+            
+            if new_operands != instr.operands:
+                new_instr = IRInstruction(
+                    opcode=instr.opcode,
+                    dest=instr.dest,
+                    operands=new_operands,
+                    line=instr.line
+                )
+                result.append(new_instr)
+            else:
+                result.append(instr)
+            
+            # 非纯操作清除受影响的常量
+            if instr.opcode == 'CALL':
+                # 简化：清除所有非常量
+                pass
+            elif instr.opcode == 'STORE' and instr.dest:
+                if instr.dest in constants:
+                    del constants[instr.dest]
+        
+        return result
+    
+    def loop_invariant_code_motion(self, ir: List[IRInstruction]) -> List[IRInstruction]:
+        """循环不变量外提 - 将循环中的不变计算移到循环外"""
+        # 简化实现：识别 LABEL...JUMP 结构的循环
+        result = ir.copy()
+        
+        # 查找循环结构
+        i = 0
+        while i < len(result):
+            if result[i].opcode == 'LABEL':
+                loop_start = i
+                loop_label = result[i].dest
+                
+                # 查找循环结束（向后跳转到此标签）
+                j = i + 1
+                loop_end = -1
+                while j < len(result):
+                    if (result[j].opcode == 'JUMP' and 
+                        len(result[j].operands) >= 1 and 
+                        result[j].operands[0] == loop_label):
+                        loop_end = j
+                        break
+                    j += 1
+                
+                if loop_end != -1:
+                    # 找到循环，尝试外提不变量
+                    loop_body = result[loop_start+1:loop_end]
+                    outside_defs = set()
+                    
+                    # 收集循环外的定义
+                    for k in range(loop_start):
+                        if result[k].dest:
+                            outside_defs.add(result[k].dest)
+                    
+                    # 查找可以外提的指令
+                    to_move = []
+                    for idx, instr in enumerate(loop_body):
+                        if self._is_loop_invariant(instr, outside_defs, loop_body):
+                            to_move.append((idx, instr))
+                    
+                    # 移动不变量到循环前
+                    if to_move:
+                        # 从后往前删除，避免索引问题
+                        for idx, instr in reversed(to_move):
+                            result.pop(loop_start + 1 + idx)
+                            result.insert(loop_start, instr)
+            
+            i += 1
+        
+        return result
+    
+    def _is_loop_invariant(self, instr: IRInstruction, outside_defs: set, loop_body: List[IRInstruction]) -> bool:
+        """检查指令是否是循环不变量"""
+        # 只考虑纯计算指令
+        if instr.opcode not in ('ADD', 'SUB', 'MUL', 'DIV', 'MOD',
+                                 'EQ', 'NE', 'LT', 'LE', 'GT', 'GE',
+                                 'AND', 'OR', 'NOT', 'NEG', 'LOAD_CONST', 'COPY'):
+            return False
+        
+        # 检查所有操作数是否在循环外定义或是常量
+        for op in instr.operands:
+            if isinstance(op, str):
+                if op not in outside_defs:
+                    # 检查是否在循环内定义
+                    defined_in_loop = any(
+                        i.dest == op for i in loop_body
+                    )
+                    if defined_in_loop:
+                        return False
+        
+        return True
+
+
+# ============================================================================
 # 字节码生成器
 # ============================================================================
 
@@ -1519,7 +1908,9 @@ class BytecodeGenerator:
         'LOAD_CONST': 0x01,
         'LOAD_GLOBAL': 0x02,
         'STORE': 0x03,
-        'ALLOC': 0x04,
+        'COPY': 0x04,
+        'ALLOC': 0x05,
+        'PARAM': 0x06,
         'ADD': 0x10,
         'SUB': 0x11,
         'MUL': 0x12,
@@ -1580,8 +1971,13 @@ class BytecodeGenerator:
             import struct
             bytecode.extend(struct.pack('<d', operand))
         elif isinstance(operand, str):
-            bytecode.append(0x03)  # string tag
-            self._encode_string(bytecode, operand)
+            # 检查是否是临时变量名 (t1, t2, etc.)
+            if operand.startswith('t') and operand[1:].isdigit():
+                bytecode.append(0x06)  # temp var tag
+                self._encode_string(bytecode, operand)
+            else:
+                bytecode.append(0x03)  # string tag
+                self._encode_string(bytecode, operand)
         elif isinstance(operand, bool):
             bytecode.append(0x04)  # bool tag
             bytecode.append(1 if operand else 0)
@@ -1610,11 +2006,13 @@ class VirtualMachine:
         self.stack: List[Any] = []
         self.globals: Dict[str, Any] = {}
         self.functions: Dict[str, Any] = {}
+        self.call_stack: List[Dict] = []  # 调用栈，保存每层调用的局部变量
         self.running = False
     
     def run(self, bytecode: bytes) -> Any:
         """运行字节码"""
         ip = 0  # instruction pointer
+        self.call_stack = [{}]  # 初始化全局作用域
         
         while ip < len(bytecode):
             opcode = bytecode[ip]
@@ -1623,6 +2021,41 @@ class VirtualMachine:
             if opcode == 0x01:  # LOAD_CONST
                 ip, value = self._decode_operand(bytecode, ip)
                 self.stack.append(value)
+            
+            elif opcode == 0x02:  # LOAD_GLOBAL
+                ip, name = self._decode_operand(bytecode, ip)
+                # 先在当前作用域查找
+                if self.call_stack and name in self.call_stack[-1]:
+                    self.stack.append(self.call_stack[-1][name])
+                elif name in self.globals:
+                    self.stack.append(self.globals[name])
+                else:
+                    # 未找到，推入 None
+                    self.stack.append(None)
+            
+            elif opcode == 0x03:  # STORE
+                ip, dest = self._decode_operand(bytecode, ip)
+                ip, value = self._decode_operand(bytecode, ip)
+                if self.call_stack:
+                    self.call_stack[-1][dest] = value
+                self.stack.append(value)
+            
+            elif opcode == 0x04:  # COPY
+                ip, dest = self._decode_operand(bytecode, ip)
+                ip, src = self._decode_operand(bytecode, ip)
+                if self.call_stack:
+                    self.call_stack[-1][dest] = src
+                self.stack.append(src)
+            
+            elif opcode == 0x06:  # PARAM
+                ip, dest = self._decode_operand(bytecode, ip)
+                ip, param_idx = self._decode_operand(bytecode, ip)
+                # 参数已经在调用时压入栈中，这里只是注册到作用域
+                if self.call_stack:
+                    # 从栈中取出参数值
+                    if len(self.stack) >= 1:
+                        param_value = self.stack.pop()
+                        self.call_stack[-1][dest] = param_value
             
             elif opcode == 0x10:  # ADD
                 b = self.stack.pop()
@@ -1644,8 +2077,85 @@ class VirtualMachine:
                 a = self.stack.pop()
                 self.stack.append(a / b if b != 0 else 0)
             
+            elif opcode == 0x50:  # CALL
+                ip, func_name = self._decode_operand(bytecode, ip)
+                # 收集参数 - 从栈中弹出
+                args = []
+                # 尝试解码后续操作数作为参数引用
+                while ip < len(bytecode):
+                    peek_tag = bytecode[ip]
+                    if peek_tag in (0x01, 0x02, 0x03, 0x04, 0x05):
+                        old_ip = ip
+                        ip, arg_val = self._decode_operand(bytecode, ip)
+                        if ip > old_ip:
+                            args.append(arg_val)
+                    else:
+                        break
+                
+                # 调用函数
+                if func_name == 'println':
+                    for arg in args:
+                        print(arg)
+                    self.stack.append(None)
+                elif func_name == 'println!':
+                    for arg in args:
+                        print(arg)
+                    self.stack.append(None)
+                elif func_name in self.functions:
+                    # 用户定义函数：创建新作用域并执行函数体
+                    func_info = self.functions[func_name]
+                    self.call_stack.append({})  # 新作用域
+                    
+                    # 将参数绑定到局部变量
+                    if 'params' in func_info:
+                        for i, param_name in enumerate(func_info['params']):
+                            if i < len(args):
+                                self.call_stack[-1][param_name] = args[i]
+                    
+                    # 保存返回位置和旧字节码
+                    old_bytecode = self.bytecode if hasattr(self, 'bytecode') else None
+                    old_ip = ip
+                    self.bytecode = func_info.get('bytecode', b'')
+                    ip = 0
+                    
+                    # 执行函数体（简化：直接递归调用 run）
+                    result = self.run(self.bytecode)
+                    
+                    # 恢复执行上下文
+                    self.call_stack.pop()
+                    if old_bytecode:
+                        self.bytecode = old_bytecode
+                    ip = old_ip
+                    
+                    self.stack.append(result)
+                else:
+                    self.stack.append(None)
+            
             elif opcode == 0x51:  # RETURN
-                return self.stack[-1] if self.stack else None
+                # 获取返回值
+                ret_value = None
+                if self.stack:
+                    ret_value = self.stack.pop()
+                
+                # 如果有调用栈，返回到调用者
+                if len(self.call_stack) > 1:
+                    self.call_stack.pop()
+                    # 返回值已经在栈中或为 None
+                    if ret_value is not None:
+                        return ret_value
+                    return self.stack[-1] if self.stack else None
+                else:
+                    # 主函数返回
+                    return ret_value if ret_value is not None else (self.stack[-1] if self.stack else None)
+            
+            elif opcode == 0x60:  # FUNCTION
+                ip, label = self._decode_operand(bytecode, ip)
+                ip, func_name = self._decode_operand(bytecode, ip)
+                # 注册函数（简化处理）
+                pass
+            
+            elif opcode == 0x61:  # END_FUNCTION
+                pass
             
             elif opcode == 0xFF:  # NOP
                 pass
@@ -1657,24 +2167,48 @@ class VirtualMachine:
         return self.stack[-1] if self.stack else None
     
     def _decode_operand(self, bytecode: bytes, ip: int) -> Tuple[int, Any]:
+        if ip >= len(bytecode):
+            return ip, None
         tag = bytecode[ip]
         ip += 1
         
         if tag == 0x01:  # int
+            if ip + 8 > len(bytecode):
+                return ip, 0
             value = int.from_bytes(bytecode[ip:ip+8], 'little', signed=True)
             ip += 8
         elif tag == 0x02:  # float
+            if ip + 8 > len(bytecode):
+                return ip, 0.0
             import struct
             value = struct.unpack('<d', bytecode[ip:ip+8])[0]
             ip += 8
         elif tag == 0x03:  # string
+            if ip >= len(bytecode):
+                return ip, ""
             length = bytecode[ip]
             ip += 1
+            if ip + length > len(bytecode):
+                return ip, ""
             value = bytecode[ip:ip+length].decode('utf-8')
             ip += length
         elif tag == 0x04:  # bool
+            if ip >= len(bytecode):
+                return ip, False
             value = bool(bytecode[ip])
             ip += 1
+        elif tag == 0x06:  # temp var reference
+            if ip >= len(bytecode):
+                return ip, None
+            length = bytecode[ip]
+            ip += 1
+            if ip + length > len(bytecode):
+                return ip, None
+            value = bytecode[ip:ip+length].decode('utf-8')
+            ip += length
+            # 从作用域中查找临时变量的值
+            if self.call_stack and value in self.call_stack[-1]:
+                value = self.call_stack[-1][value]
         else:
             value = None
         
@@ -1688,8 +2222,9 @@ class VirtualMachine:
 class Compiler:
     """Aether 编译器"""
     
-    def __init__(self, filename: str):
+    def __init__(self, filename: str, optimization_level: int = 1):
         self.filename = filename
+        self.optimization_level = optimization_level
         with open(filename, 'r', encoding='utf-8') as f:
             self.source = f.read()
     
@@ -1710,9 +2245,16 @@ class Compiler:
         if emit == 'ir':
             return ir
         
+        # 优化
+        optimizer = Optimizer(optimization_level=self.optimization_level)
+        optimized_ir = optimizer.optimize(ir)
+        
+        if emit == 'optimized_ir':
+            return optimized_ir
+        
         # 字节码生成
         bc_gen = BytecodeGenerator()
-        bytecode = bc_gen.generate(ir)
+        bytecode = bc_gen.generate(optimized_ir)
         
         if emit == 'bytecode':
             return bytecode
@@ -1733,14 +2275,16 @@ def main():
     parser = argparse.ArgumentParser(description='Aether Compiler')
     parser.add_argument('input', help='Input Aether source file')
     parser.add_argument('-o', '--output', help='Output file')
-    parser.add_argument('--emit', choices=['ir', 'bytecode', 'run'], default='run',
-                       help='Emit IR, bytecode, or run directly')
+    parser.add_argument('--emit', choices=['ir', 'optimized_ir', 'bytecode', 'run'], default='run',
+                       help='Emit IR, optimized IR, bytecode, or run directly')
+    parser.add_argument('-O', '--optimize', type=int, choices=[0, 1, 2, 3], default=1,
+                       help='Optimization level (0=none, 1=basic, 2=advanced, 3=aggressive)')
     parser.add_argument('--ast', action='store_true', help='Print AST')
     
     args = parser.parse_args()
     
     try:
-        compiler = Compiler(args.input)
+        compiler = Compiler(args.input, optimization_level=args.optimize)
         
         if args.ast:
             lexer = Lexer(compiler.source, args.input)
@@ -1761,6 +2305,9 @@ def main():
             if output is not None:
                 print(output)
         elif args.emit == 'ir':
+            for instr in result:
+                print(instr)
+        elif args.emit == 'optimized_ir':
             for instr in result:
                 print(instr)
         elif args.output:

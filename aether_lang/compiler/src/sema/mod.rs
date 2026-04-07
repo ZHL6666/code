@@ -6,6 +6,9 @@ use crate::ast::*;
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 
+pub mod borrow_check;
+pub use borrow_check::BorrowChecker;
+
 /// 语义分析器
 pub struct SemanticAnalyzer {
     /// 符号表
