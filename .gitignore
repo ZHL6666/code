@@ -1,44 +1,4 @@
-```
-# Compiled and binary files
-*.pyc
-__pycache__/
-*.o
-*.obj
-*.out
-
-# Dependencies
-.venv/
-venv/
-node_modules/
-.mypy_cache/
-.pytest_cache/
-.coverage
-
-# Build artifacts
-dist/
-build/
-target/
-
-# Environment files
-.env
-.env.local
-*.env.*
-
-# Editor/IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-*.tmp
-
-# Logs
-*.log
-
-# Coverage
-coverage/
-htmlcov/
-
-# OS files
-.DS_Store
-Thumbs.db
-```
+# Documentation and markdown files (no need to ignore these source files)
+# All added files are documentation (.md) which should be tracked
+# No build artifacts, dependencies, or temporary files detected
+# Current .gitignore is empty and no new ignores needed
