@@ -1,0 +1,370 @@
+// 数据处理管道 - 展示函数式编程、泛型和集合操作
+
+use std::collections
+use std::io
+
+// 日志条目结构
+@derive(Debug, Clone)
+struct LogEntry {
+    timestamp: String,
+    level: LogLevel,
+    service: String,
+    message: String,
+    metadata: HashMap[String, String]
+}
+
+// 日志级别枚举
+enum LogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Critical
+}
+
+impl LogLevel {
+    fn from_string(s: String) -> Option<LogLevel> {
+        match s.to_uppercase() {
+            "DEBUG" => Some(LogLevel.Debug),
+            "INFO" => Some(LogLevel.Info),
+            "WARNING" | "WARN" => Some(LogLevel.Warning),
+            "ERROR" => Some(LogLevel.Error),
+            "CRITICAL" | "FATAL" => Some(LogLevel.Critical),
+            _ => None
+        }
+    }
+    
+    fn to_int(self) -> Int {
+        match self {
+            LogLevel.Debug => 0,
+            LogLevel.Info => 1,
+            LogLevel.Warning => 2,
+            LogLevel.Error => 3,
+            LogLevel.Critical => 4
+        }
+    }
+}
+
+// 实现 Show trait 用于显示
+trait Show {
+    fn show(self) -> String
+}
+
+impl Show for LogLevel {
+    fn show(self) -> String {
+        match self {
+            LogLevel.Debug => "DEBUG",
+            LogLevel.Info => "INFO",
+            LogLevel.Warning => "WARNING",
+            LogLevel.Error => "ERROR",
+            LogLevel.Critical => "CRITICAL"
+        }
+    }
+}
+
+// 解析日志行
+fn parse_log_line(line: String) -> Option<LogEntry> {
+    // 期望格式：[TIMESTAMP] LEVEL [SERVICE] MESSAGE {key=value,...}
+    let pattern = r"\[(.*?)\]\s+(\w+)\s+\[(.*?)\]\s+(.*?)(?:\s+\{(.*?)\})?$"
+    
+    match regex::match(pattern, line) {
+        Some(matches) => {
+            let timestamp = matches[0]
+            let level_str = matches[1]
+            let service = matches[2]
+            let message = matches[3]
+            let metadata_str = matches.get(4).unwrap_or("")
+            
+            let level = LogLevel.from_string(level_str)?
+            let metadata = parse_metadata(metadata_str)
+            
+            Some(LogEntry {
+                timestamp,
+                level,
+                service,
+                message,
+                metadata
+            })
+        },
+        None => None
+    }
+}
+
+fn parse_metadata(metadata_str: String) -> HashMap[String, String] {
+    let mut metadata = HashMap[String, String]()
+    
+    if metadata_str.is_empty() {
+        return metadata
+    }
+    
+    for pair in metadata_str.split(",") {
+        let parts = pair.split("=").collect::<Vec<String>>()
+        if parts.length() == 2 {
+            metadata.insert(parts[0].trim(), parts[1].trim())
+        }
+    }
+    
+    metadata
+}
+
+// 数据转换管道构建器
+struct Pipeline<T> {
+    data: Vec<T>,
+    transformations: Vec<Fn(Vec<T>) -> Vec<T>>
+}
+
+impl<T> Pipeline<T> {
+    fn new(data: Vec<T>) -> Pipeline<T> {
+        Pipeline {
+            data,
+            transformations: Vec()
+        }
+    }
+    
+    fn filter(mut self, predicate: Fn(&T) -> Bool) -> Pipeline<T> {
+        let pred = predicate
+        self.transformations.push(fn(data) {
+            data.filter(pred)
+        })
+        self
+    }
+    
+    fn map<U>(self, mapper: Fn(T) -> U) -> Pipeline<U> {
+        let current_transforms = self.transformations
+        let map_fn = mapper
+        
+        let new_transforms = current_transforms.append(
+            vec![fn(data) { data.map(map_fn) }]
+        )
+        
+        Pipeline {
+            data: Vec(),  // 类型已变更
+            transformations: new_transforms
+        }
+    }
+    
+    fn execute(self) -> Vec<T> {
+        let mut result = self.data.clone()
+        
+        for transform in self.transformations {
+            result = transform(result)
+        }
+        
+        result
+    }
+}
+
+// 使用管道操作符的函数式处理
+fn process_logs_functional(logs: Vec<String>) -> collections.HashMap[String, Int] {
+    logs
+    |> filter_map(fn(line) { parse_log_line(line) })  // 解析并过滤无效行
+    |> filter(fn(entry) { entry.level.to_int() >= LogLevel.Warning.to_int() })  // 只保留警告及以上
+    |> map(fn(entry) { entry.service })  // 提取服务名
+    |> group_by(fn(service) { service })  // 按服务分组
+    |> map_values(fn(entries) { entries.length() })  // 计算每个服务的错误数
+    |> sort_by_key(fn(kv) { kv.1 }, descending=true)  // 按错误数降序排序
+}
+
+// 使用方法链的处理方式
+fn process_logs_method_chain(logs: Vec<String>) -> Vec<(String, Int)> {
+    let parsed = logs
+        .iter()
+        .filter_map(|line| parse_log_line(line))
+        .collect::<Vec<LogEntry>>()
+    
+    let warnings_and_above = parsed
+        .iter()
+        .filter(|entry| entry.level.to_int() >= 2)
+        .collect::<Vec<&LogEntry>>()
+    
+    let service_counts = warnings_and_above
+        .iter()
+        .fold(HashMap[String, Int](), |mut acc, entry| {
+            *acc.entry(entry.service.clone()).or_insert(0) += 1
+            acc
+        })
+    
+    let mut sorted: Vec<(String, Int)> = service_counts.into_iter().collect()
+    sorted.sort_by(|a, b| b.1.cmp(&a.1))
+    
+    sorted
+}
+
+// 生成报告
+fn generate_report(stats: Vec<(String, Int)>, total_logs: Int) -> String {
+    let mut report = String()
+    
+    report.push_line("=== 日志分析报告 ===")
+    report.push_line(f"总日志数：{total_logs}")
+    report.push_line("")
+    report.push_line("服务错误统计（按严重程度）:")
+    report.push_line("-".repeat(40))
+    
+    for (service, count) in stats {
+        let percentage = (count as Float / total_logs as Float) * 100.0
+        let bar = "█".repeat((percentage / 2.5) as Int)
+        report.push_line(f"{service.pad_end(20)} | {count:5} ({percentage:5.1}%) {bar}")
+    }
+    
+    report.push_line("-".repeat(40))
+    
+    let critical_services = stats
+        .filter(|(_, count)| count > &100)
+        .map(|(service, _)| service)
+        .collect::<Vec<String>>()
+    
+    if !critical_services.is_empty() {
+        report.push_line("")
+        report.push_line("⚠️  需要关注的服务:")
+        for service in critical_services {
+            report.push_line(f"  - {service}")
+        }
+    }
+    
+    report
+}
+
+// 从文件读取日志
+async fn read_log_file(path: String) -> Result<Vec<String>, io::Error> {
+    let content = io::fs::read_to_string(path)?
+    Ok(content.lines().collect())
+}
+
+// 实时日志流处理
+actor LogProcessor {
+    var buffer: Vec<LogEntry> = Vec()
+    var alert_threshold: Int = 10
+    
+    message Process(entry: LogEntry) {
+        buffer.push(entry)
+        
+        // 检查是否需要告警
+        let recent_errors = buffer
+            .filter(|e| e.level.to_int() >= LogLevel.Error.to_int())
+            .length()
+        
+        if recent_errors > alert_threshold {
+            send_alert(f"High error rate detected: {recent_errors} errors in buffer")
+        }
+        
+        // 保持缓冲区大小
+        if buffer.length() > 1000 {
+            buffer = buffer.slice(buffer.length() - 1000, buffer.length())
+        }
+    }
+    
+    message GetStats(reply_to: Channel<HashMap[String, Int]>) {
+        let stats = buffer
+            .iter()
+            .fold(HashMap[String, Int](), |mut acc, entry| {
+                let key = f"{entry.service}:{entry.level.show()}"
+                *acc.entry(key).or_insert(0) += 1
+                acc
+            })
+        
+        reply_to.send(stats)
+    }
+    
+    message SetThreshold(new_threshold: Int) {
+        alert_threshold = new_threshold
+    }
+}
+
+fn send_alert(message: String) {
+    println(f"🚨 ALERT: {message}")
+    // 实际应用中会发送邮件、短信等
+}
+
+// 主函数
+async fn main() {
+    println("=== Aether 日志分析系统 ===\n")
+    
+    // 示例日志数据
+    let sample_logs = vec![
+        "[2024-01-15 10:30:00] INFO [api-gateway] Request processed successfully {method=GET, path=/users}",
+        "[2024-01-15 10:30:01] ERROR [database] Connection timeout {host=db-01, port=5432}",
+        "[2024-01-15 10:30:02] WARNING [cache] Cache miss rate high {rate=0.45}",
+        "[2024-01-15 10:30:03] ERROR [api-gateway] Failed to authenticate user {user_id=12345}",
+        "[2024-01-15 10:30:04] CRITICAL [database] Database connection lost",
+        "[2024-01-15 10:30:05] INFO [scheduler] Scheduled task completed {task=cleanup}",
+        "[2024-01-15 10:30:06] ERROR [cache] Redis connection failed {retry=3}",
+        "[2024-01-15 10:30:07] WARNING [api-gateway] Rate limit approaching {current=950, max=1000}",
+    ]
+    
+    println("原始日志样本:\n")
+    for log in sample_logs.iter().take(5) {
+        println(log)
+    }
+    println("\n... (更多日志)\n")
+    
+    // 方法 1: 函数式管道处理
+    println("方法 1: 函数式管道处理")
+    let stats1 = process_logs_functional(sample_logs.clone())
+    let report1 = generate_report(stats1.into_iter().collect(), sample_logs.length())
+    println(report1)
+    
+    // 方法 2: 方法链处理
+    println("\n方法 2: 方法链处理")
+    let stats2 = process_logs_method_chain(sample_logs.clone())
+    let report2 = generate_report(stats2, sample_logs.length())
+    println(report2)
+    
+    // 启动实时处理器
+    println("\n启动实时日志处理器...")
+    let processor = LogProcessor.spawn()
+    
+    // 模拟实时日志流
+    for log_line in sample_logs {
+        if let Some(entry) = parse_log_line(log_line) {
+            processor.send(LogProcessorMessage.Process(entry))
+        }
+    }
+    
+    // 获取统计信息
+    let (reply_channel, result) = Channel::new()
+    processor.send(LogProcessorMessage.GetStats(reply_channel))
+    let realtime_stats = await result
+    
+    println("\n实时处理统计:")
+    for (key, value) in realtime_stats {
+        println(f"  {key}: {value}")
+    }
+}
+
+// 单元测试
+#[test]
+fn test_parse_log_line() {
+    let line = "[2024-01-15 10:30:00] ERROR [database] Connection failed {host=localhost}"
+    let entry = parse_log_line(line).unwrap()
+    
+    assert_eq!(entry.timestamp, "2024-01-15 10:30:00")
+    assert_eq!(entry.level, LogLevel.Error)
+    assert_eq!(entry.service, "database")
+    assert_eq!(entry.message, "Connection failed")
+    assert_eq!(entry.metadata.get("host"), Some("localhost"))
+}
+
+#[test]
+fn test_log_level_conversion() {
+    assert_eq!(LogLevel.from_string("error"), Some(LogLevel.Error))
+    assert_eq!(LogLevel.from_string("WARNING"), Some(LogLevel.Warning))
+    assert_eq!(LogLevel.from_string("invalid"), None)
+    
+    assert_eq!(LogLevel.Error.to_int(), 3)
+    assert_eq!(LogLevel.Warning.to_int(), 2)
+}
+
+#[test]
+fn test_filter_by_level() {
+    let logs = vec![
+        LogEntry { timestamp: String(), level: LogLevel.Debug, service: String(), message: String(), metadata: HashMap() },
+        LogEntry { timestamp: String(), level: LogLevel.Error, service: String(), message: String(), metadata: HashMap() },
+        LogEntry { timestamp: String(), level: LogLevel.Critical, service: String(), message: String(), metadata: HashMap() },
+    ]
+    
+    let filtered = logs
+        .filter(|e| e.level.to_int() >= LogLevel.Warning.to_int())
+        .collect::<Vec<LogEntry>>()
+    
+    assert_eq!(filtered.length(), 2)
+}

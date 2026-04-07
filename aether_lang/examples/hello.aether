@@ -1,0 +1,5 @@
+// Hello World - Aether 入门示例
+
+fn main() {
+    println("Hello, World!")
+}
