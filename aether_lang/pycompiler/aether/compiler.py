@@ -1391,10 +1391,11 @@ class IRGenerator:
         self._emit("FUNCTION", dest=label, operands=[func.name], line=func.line)
         
         self._enter_scope()
-        for param_name, param_type in func.params:
+        # 将参数注册到当前作用域
+        for i, (param_name, param_type) in enumerate(func.params):
             temp = self._new_temp()
             self._current_scope()[param_name] = temp
-            self._emit("PARAM", dest=temp, operands=[param_name], line=func.line)
+            self._emit("PARAM", dest=temp, operands=[param_name, i], line=func.line)
         
         if func.body:
             self._generate_block(func.body)
@@ -1412,7 +1413,7 @@ class IRGenerator:
         
         if decl.initializer:
             value = self._generate_expression(decl.initializer)
-            self._emit("STORE", dest=temp, operands=[value], line=decl.line)
+            self._emit("COPY", dest=temp, operands=[value], line=decl.line)
         else:
             self._emit("ALLOC", dest=temp, operands=[decl.type_annotation or "any"], line=decl.line)
     
@@ -1485,6 +1486,7 @@ class IRGenerator:
         elif isinstance(expr, Identifier):
             if expr.name in self._current_scope():
                 return self._current_scope()[expr.name]
+            # 全局变量或函数参数
             temp = self._new_temp()
             self._emit("LOAD_GLOBAL", dest=temp, operands=[expr.name], line=expr.line)
             return temp
@@ -1510,8 +1512,15 @@ class IRGenerator:
         
         elif isinstance(expr, Assignment):
             value = self._generate_expression(expr.value)
-            # 简化处理
-            self._emit("STORE", dest=value, operands=[value], line=expr.line)
+            # 查找目标变量在作用域中的映射
+            if isinstance(expr.target, Identifier):
+                target_name = expr.target.name
+                if target_name in self._current_scope():
+                    target_temp = self._current_scope()[target_name]
+                    self._emit("STORE", dest=target_temp, operands=[value], line=expr.line)
+                else:
+                    # 新变量声明
+                    self._current_scope()[target_name] = value
             return value
         
         elif isinstance(expr, Call):
@@ -1899,7 +1908,9 @@ class BytecodeGenerator:
         'LOAD_CONST': 0x01,
         'LOAD_GLOBAL': 0x02,
         'STORE': 0x03,
-        'ALLOC': 0x04,
+        'COPY': 0x04,
+        'ALLOC': 0x05,
+        'PARAM': 0x06,
         'ADD': 0x10,
         'SUB': 0x11,
         'MUL': 0x12,
@@ -1960,8 +1971,13 @@ class BytecodeGenerator:
             import struct
             bytecode.extend(struct.pack('<d', operand))
         elif isinstance(operand, str):
-            bytecode.append(0x03)  # string tag
-            self._encode_string(bytecode, operand)
+            # 检查是否是临时变量名 (t1, t2, etc.)
+            if operand.startswith('t') and operand[1:].isdigit():
+                bytecode.append(0x06)  # temp var tag
+                self._encode_string(bytecode, operand)
+            else:
+                bytecode.append(0x03)  # string tag
+                self._encode_string(bytecode, operand)
         elif isinstance(operand, bool):
             bytecode.append(0x04)  # bool tag
             bytecode.append(1 if operand else 0)
@@ -1990,11 +2006,13 @@ class VirtualMachine:
         self.stack: List[Any] = []
         self.globals: Dict[str, Any] = {}
         self.functions: Dict[str, Any] = {}
+        self.call_stack: List[Dict] = []  # 调用栈，保存每层调用的局部变量
         self.running = False
     
     def run(self, bytecode: bytes) -> Any:
         """运行字节码"""
         ip = 0  # instruction pointer
+        self.call_stack = [{}]  # 初始化全局作用域
         
         while ip < len(bytecode):
             opcode = bytecode[ip]
@@ -2003,6 +2021,41 @@ class VirtualMachine:
             if opcode == 0x01:  # LOAD_CONST
                 ip, value = self._decode_operand(bytecode, ip)
                 self.stack.append(value)
+            
+            elif opcode == 0x02:  # LOAD_GLOBAL
+                ip, name = self._decode_operand(bytecode, ip)
+                # 先在当前作用域查找
+                if self.call_stack and name in self.call_stack[-1]:
+                    self.stack.append(self.call_stack[-1][name])
+                elif name in self.globals:
+                    self.stack.append(self.globals[name])
+                else:
+                    # 未找到，推入 None
+                    self.stack.append(None)
+            
+            elif opcode == 0x03:  # STORE
+                ip, dest = self._decode_operand(bytecode, ip)
+                ip, value = self._decode_operand(bytecode, ip)
+                if self.call_stack:
+                    self.call_stack[-1][dest] = value
+                self.stack.append(value)
+            
+            elif opcode == 0x04:  # COPY
+                ip, dest = self._decode_operand(bytecode, ip)
+                ip, src = self._decode_operand(bytecode, ip)
+                if self.call_stack:
+                    self.call_stack[-1][dest] = src
+                self.stack.append(src)
+            
+            elif opcode == 0x06:  # PARAM
+                ip, dest = self._decode_operand(bytecode, ip)
+                ip, param_idx = self._decode_operand(bytecode, ip)
+                # 参数已经在调用时压入栈中，这里只是注册到作用域
+                if self.call_stack:
+                    # 从栈中取出参数值
+                    if len(self.stack) >= 1:
+                        param_value = self.stack.pop()
+                        self.call_stack[-1][dest] = param_value
             
             elif opcode == 0x10:  # ADD
                 b = self.stack.pop()
@@ -2024,8 +2077,44 @@ class VirtualMachine:
                 a = self.stack.pop()
                 self.stack.append(a / b if b != 0 else 0)
             
+            elif opcode == 0x50:  # CALL
+                ip, func_name = self._decode_operand(bytecode, ip)
+                # 收集参数 - 从栈中弹出
+                args = []
+                # 尝试解码后续操作数作为参数引用
+                while ip < len(bytecode):
+                    peek_tag = bytecode[ip]
+                    if peek_tag in (0x01, 0x02, 0x03, 0x04, 0x05):
+                        old_ip = ip
+                        ip, arg_val = self._decode_operand(bytecode, ip)
+                        if ip > old_ip:
+                            args.append(arg_val)
+                    else:
+                        break
+                
+                # 调用函数
+                if func_name == 'println':
+                    for arg in args:
+                        print(arg)
+                    self.stack.append(None)
+                elif func_name == 'println!':
+                    for arg in args:
+                        print(arg)
+                    self.stack.append(None)
+                else:
+                    self.stack.append(None)
+            
             elif opcode == 0x51:  # RETURN
                 return self.stack[-1] if self.stack else None
+            
+            elif opcode == 0x60:  # FUNCTION
+                ip, label = self._decode_operand(bytecode, ip)
+                ip, func_name = self._decode_operand(bytecode, ip)
+                # 注册函数（简化处理）
+                pass
+            
+            elif opcode == 0x61:  # END_FUNCTION
+                pass
             
             elif opcode == 0xFF:  # NOP
                 pass
@@ -2037,24 +2126,48 @@ class VirtualMachine:
         return self.stack[-1] if self.stack else None
     
     def _decode_operand(self, bytecode: bytes, ip: int) -> Tuple[int, Any]:
+        if ip >= len(bytecode):
+            return ip, None
         tag = bytecode[ip]
         ip += 1
         
         if tag == 0x01:  # int
+            if ip + 8 > len(bytecode):
+                return ip, 0
             value = int.from_bytes(bytecode[ip:ip+8], 'little', signed=True)
             ip += 8
         elif tag == 0x02:  # float
+            if ip + 8 > len(bytecode):
+                return ip, 0.0
             import struct
             value = struct.unpack('<d', bytecode[ip:ip+8])[0]
             ip += 8
         elif tag == 0x03:  # string
+            if ip >= len(bytecode):
+                return ip, ""
             length = bytecode[ip]
             ip += 1
+            if ip + length > len(bytecode):
+                return ip, ""
             value = bytecode[ip:ip+length].decode('utf-8')
             ip += length
         elif tag == 0x04:  # bool
+            if ip >= len(bytecode):
+                return ip, False
             value = bool(bytecode[ip])
             ip += 1
+        elif tag == 0x06:  # temp var reference
+            if ip >= len(bytecode):
+                return ip, None
+            length = bytecode[ip]
+            ip += 1
+            if ip + length > len(bytecode):
+                return ip, None
+            value = bytecode[ip:ip+length].decode('utf-8')
+            ip += length
+            # 从作用域中查找临时变量的值
+            if self.call_stack and value in self.call_stack[-1]:
+                value = self.call_stack[-1][value]
         else:
             value = None
         
