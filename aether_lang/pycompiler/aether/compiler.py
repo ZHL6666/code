@@ -88,6 +88,10 @@ class TokenType(Enum):
     EOF = "EOF"
     NEWLINE = "NEWLINE"
     COMMENT = "COMMENT"
+    
+    # 引用操作符
+    AMPERSAND = "&"
+    MUT = "mut"
 
 
 class Keyword(Enum):
@@ -398,13 +402,16 @@ class Lexer:
                 if self._match(expected):
                     return Token(token_type, ch + expected, start_line, start_column)
         
-        # 单字符运算符映射
+        # 单字符运算符映射 - 注意：& 现在作为引用操作符单独处理
         single_ops = {
             '+': TokenType.PLUS, '-': TokenType.MINUS, '*': TokenType.STAR,
             '/': TokenType.SLASH, '=': TokenType.EQUAL, '!': TokenType.NOT,
-            '<': TokenType.LESS, '>': TokenType.GREATER, '&': TokenType.BIT_AND,
-            '|': TokenType.BIT_OR,
+            '<': TokenType.LESS, '>': TokenType.GREATER, '|': TokenType.BIT_OR,
         }
+        
+        # & 特殊处理：作为引用操作符而不是位与
+        if ch == '&':
+            return Token(TokenType.AMPERSAND, ch, start_line, start_column)
         
         if ch in single_ops:
             return Token(single_ops[ch], ch, start_line, start_column)
@@ -445,6 +452,13 @@ class BinaryOp(ASTNode):
 class UnaryOp(ASTNode):
     operator: str = ""
     operand: ASTNode = field(default_factory=lambda: ASTNode())
+
+
+@dataclass
+class ReferenceExpr(ASTNode):
+    """引用表达式 (&x 或 &mut x)"""
+    operand: ASTNode = field(default_factory=lambda: ASTNode())
+    is_mut: bool = False
 
 
 @dataclass
@@ -1175,6 +1189,17 @@ class Parser:
         return left
     
     def _parse_unary(self) -> ASTNode:
+        # 引用操作符 & 和 &mut
+        if self._check(TokenType.AMPERSAND):
+            self._advance()
+            is_mut = False
+            if self._check(TokenType.KEYWORD) and self._peek().keyword == Keyword.MUT:
+                self._advance()
+                is_mut = True
+            operand = self._parse_unary()
+            return ReferenceExpr(operand=operand, is_mut=is_mut,
+                               line=self._previous().line, column=self._previous().column)
+        
         if self._check(TokenType.MINUS, TokenType.NOT, TokenType.BIT_NOT):
             op_token = self._advance()
             operand = self._parse_unary()
