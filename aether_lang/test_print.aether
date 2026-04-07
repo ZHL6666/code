@@ -1,0 +1,5 @@
+fn main() {
+    println!("Hello, Aether!");
+    let x = 42;
+    println!(x);
+}

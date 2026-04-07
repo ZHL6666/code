@@ -2101,11 +2101,52 @@ class VirtualMachine:
                     for arg in args:
                         print(arg)
                     self.stack.append(None)
+                elif func_name in self.functions:
+                    # 用户定义函数：创建新作用域并执行函数体
+                    func_info = self.functions[func_name]
+                    self.call_stack.append({})  # 新作用域
+                    
+                    # 将参数绑定到局部变量
+                    if 'params' in func_info:
+                        for i, param_name in enumerate(func_info['params']):
+                            if i < len(args):
+                                self.call_stack[-1][param_name] = args[i]
+                    
+                    # 保存返回位置和旧字节码
+                    old_bytecode = self.bytecode if hasattr(self, 'bytecode') else None
+                    old_ip = ip
+                    self.bytecode = func_info.get('bytecode', b'')
+                    ip = 0
+                    
+                    # 执行函数体（简化：直接递归调用 run）
+                    result = self.run(self.bytecode)
+                    
+                    # 恢复执行上下文
+                    self.call_stack.pop()
+                    if old_bytecode:
+                        self.bytecode = old_bytecode
+                    ip = old_ip
+                    
+                    self.stack.append(result)
                 else:
                     self.stack.append(None)
             
             elif opcode == 0x51:  # RETURN
-                return self.stack[-1] if self.stack else None
+                # 获取返回值
+                ret_value = None
+                if self.stack:
+                    ret_value = self.stack.pop()
+                
+                # 如果有调用栈，返回到调用者
+                if len(self.call_stack) > 1:
+                    self.call_stack.pop()
+                    # 返回值已经在栈中或为 None
+                    if ret_value is not None:
+                        return ret_value
+                    return self.stack[-1] if self.stack else None
+                else:
+                    # 主函数返回
+                    return ret_value if ret_value is not None else (self.stack[-1] if self.stack else None)
             
             elif opcode == 0x60:  # FUNCTION
                 ip, label = self._decode_operand(bytecode, ip)

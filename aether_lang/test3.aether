@@ -1,0 +1,1 @@
+fn main() { if true { return 42; } else { return 0; } }
